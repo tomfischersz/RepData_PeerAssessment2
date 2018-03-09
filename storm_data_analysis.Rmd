@@ -1,0 +1,43 @@
+---
+title: "Reproducible Research: Peer Assessment 2"
+author: "Thomas Fischer"
+date: "March 7, 2018"
+output: 
+    html_document:
+    keep_md: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(scipen=999)
+```
+
+## Loading and preprocessing the data
+**1. Load the data (if necessary download it)**
+```{r get_data, cache=TRUE, message=FALSE, warning=FALSE, results='hide'}
+data_file <- 'stormData.csv'
+
+if (! file.exists('./data')) {
+    dir.create('./data')
+}
+if(! file.exists(file.path('./data', data_file))){
+    print('No file!')
+    zip_archive <- './data/stormData.csv.bz2'
+    if (! file.exists(file.path('./data', zip_archive))) {
+        print('No zip archive!')
+        url_arch<-'https://d396qusza40orc.cloudfront.net/repdata%2Fdata%2FStormData.csv.bz2'
+        # download.file(url = url_arch, destfile = zip_archive)
+    }
+    unzip("data/stormData.csv.bz2")
+    require(R.utils)
+    bunzip2("data/stormData.csv.bz2", "data/stormData.csv",
+            remove = FALSE, skip = TRUE)
+}
+```
+```{R load_data, cache=TRUE}
+require(data.table)
+data <- fread('data/stormData.csv')
+str(data)
+```
+```{R check_data, cache=TRUE}
+str(data)
+```

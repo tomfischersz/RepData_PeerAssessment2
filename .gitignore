@@ -8,6 +8,9 @@
 # html files
 *.html
 
+# cache
+storm_data_analysis_cache/*
+
 # Data Folder (often too big for Github)
 data/*
 
