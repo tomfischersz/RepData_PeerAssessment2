@@ -3,7 +3,7 @@ title: "Reproducible Research: Peer Assessment 2"
 author: "Thomas Fischer"
 date: "April 13, 2018"
 output: 
-    html_document:
+  html_document:
     keep_md: true
 ---
 ```{r setup, include=FALSE}
