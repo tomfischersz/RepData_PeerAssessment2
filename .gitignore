@@ -14,7 +14,8 @@ storm_data_analysis_cache/*
 # Data Folder (often too big for Github)
 data/*
 
-
+# documentation
+*.pdf
 
 # scripts for playful exploratory data analysis
 eda??.R

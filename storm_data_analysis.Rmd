@@ -1,7 +1,7 @@
 ---
 title: "Reproducible Research: Peer Assessment 2"
 author: "Thomas Fischer"
-date: "March 7, 2018"
+date: "April 13, 2018"
 output: 
     html_document:
     keep_md: true
@@ -10,9 +10,31 @@ output:
 knitr::opts_chunk$set(echo = TRUE)
 options(scipen=999)
 ```
+# Severe Weather Events and their Impact on Public Health and Economy
 
-## Loading and preprocessing the data
-**1. Load the data (if necessary download it)**
+## 1. Synopsis  
+
+The aim of this report is to identify the most harmful weather types in the US both regarding to population health (fatalities and injuries) and economy (property and crop damages). The analysis uses data from the NOAA Storm Database for the years 1993 through 2011. A big part of this analysis was cleaning the data and grouping it finally to 48 distinct event types. As the quality of the data often seemed not very accuarate all findings here should be handled very carefully. The monetary amounts for damages are adjusted by CPI with base year 2017.  
+
+As to consequences to population health the events “EXCESSIVE HEAT” and “TORNADO” are the most harmful ones, followed by events “HEAT” and “FLASH FLOOD”, while event “TORNADO” is also responsible for an unusual high number of injuries.  
+
+Most harmful events with respect to economy is clearly “HURRICANE/TYPHOON”, with nearly twice the damages than “FLOOD” and “STORM SURGE/TIDE” events. Property damages mostly outstand crop damages except for “DROUGHT”.
+
+## 2. Data Processing  
+
+The necessary R libraries:
+```{r load_libraries, message=FALSE, warning=FALSE, results='hide'}
+require(data.table)
+require(dplyr)
+require(quantmod)
+require(ggplot2)
+require(lubridate)
+require(knitr)
+require(ggrepel)
+```
+
+### 2.1. Load the data  
+Check if either unzipped or zipped original NOAA Storm Database file exists (if necessary download and unzip it):
 ```{r get_data, cache=TRUE, message=FALSE, warning=FALSE, results='hide'}
 data_file <- 'stormData.csv'
 
@@ -20,12 +42,11 @@ if (! file.exists('./data')) {
     dir.create('./data')
 }
 if(! file.exists(file.path('./data', data_file))){
-    print('No file!')
     zip_archive <- './data/stormData.csv.bz2'
     if (! file.exists(file.path('./data', zip_archive))) {
         print('No zip archive!')
         url_arch<-'https://d396qusza40orc.cloudfront.net/repdata%2Fdata%2FStormData.csv.bz2'
-        # download.file(url = url_arch, destfile = zip_archive)
+        download.file(url = url_arch, destfile = zip_archive)
     }
     unzip("data/stormData.csv.bz2")
     require(R.utils)
@@ -33,11 +54,475 @@ if(! file.exists(file.path('./data', data_file))){
             remove = FALSE, skip = TRUE)
 }
 ```
-```{R load_data, cache=TRUE}
-require(data.table)
+
+Load the data into a data.table (faster than data.frame) object.
+```{R load_data, cache=TRUE, message=FALSE, warning=FALSE, results='hide'}
 data <- fread('data/stormData.csv')
-str(data)
 ```
-```{R check_data, cache=TRUE}
-str(data)
+
+The data consists of 902297 observations and 37 variables:
+```{R check_data}
+dim(data)
 ```
+
+### 2.2. Preprocess the data
+
+Disregarding the unique variable REFNUM, the data set contains 3143 duplicates. The duplicated observations will be removed.
+```{r duplicates}
+dupl_index <- select(data, -REFNUM) %>% duplicated()
+data <- data[!dupl_index,]
+sum(dupl_index)
+```
+
+Converting the character variable BGN_DATE to a class 'Date' variable.
+```{r conv_date}
+data[, BGN_DATE:= as.Date(mdy_hms(BGN_DATE))]
+data[, YEAR:=year(BGN_DATE)]
+summary(data$BGN_DATE)
+```
+
+Exploring the data set we concluded that following variables are sufficient for answering the questions we are interested in:
+```{r important_variables}
+names(data)[c(2, 8, 23:28)]
+```
+
+For convenience we load only them (additionally some information on state/county and the remarks variable)
+```{r select_data, message=FALSE, warning=FALSE, results='hide'}
+data <- data[, .(REFNUM, YEAR, BGN_DATE, EVTYPE, STATE, COUNTYNAME,
+                 FATALITIES, INJURIES,
+                 PROPDMG, PROPDMGEXP, CROPDMG, CROPDMGEXP,
+                 REMARKS)]
+gc()
+```
+
+As our data spans more than sixty years we should think about making adjustments to the monetary values because of inflation. This can be done by obtaining CPI data from [FRED](https://fred.stlouisfed.org/) using R's 'quantmod' package.  
+**Note that the CPI Index we adjusted to basis year 2017.**
+```{r cpi_adjustment_1}
+getSymbols("CPIAUCSL", src='FRED')
+cpi_monthly <- as.data.frame(CPIAUCSL) ; rm(CPIAUCSL)
+cpi_monthly <- cbind(cpi_date = rownames(cpi_monthly), cpi_monthly)
+cpi_monthly$cpi_date <- as.character(cpi_monthly$cpi_date)
+cpi_monthly$cpi_year <- year(as.Date(cpi_monthly$cpi_date, format = "%Y-%m-%d"))
+
+cpi_yearly <- cpi_monthly %>%
+    group_by(cpi_year) %>% summarise(cpi = mean(CPIAUCSL)) %>% as.data.frame()
+rm(cpi_monthly)
+cpi_yearly$adj_factor <- cpi_yearly$cpi/cpi_yearly$cpi[cpi_yearly$cpi_year == 2017]
+cpi_yearly <- cpi_yearly %>% 
+    filter(cpi_year >= data[, min(year(BGN_DATE))] &
+               cpi_year <= data[, max(year(BGN_DATE))])
+cpi_yearly$cpi <- NULL
+```
+Now merge our adjusted CPI Index values for the years into our data.
+```{r cpi_adjustment_2}
+data <- merge(data, cpi_yearly, by.x = 'YEAR', by.y = 'cpi_year')
+rm(cpi_yearly)
+tail(data[, c(1:9)], 20)
+```
+```
+
+### 2.3 Property and Crop Damage Data Cleaning  
+Values for damages are stored in numerical variables 'PROPDMG' (e.g. damages on buildings, power lines and vehicles) and 'CROPDMG' (e.g. crop damage, grain bins and cows killed).  
+These two variables are accompanied by 'PROPDMGEXP' and 'CROPDMGEXP' with an alphabetical character signifying the magnitude of the values in variables 'PROPDMG' and 'CROPDMG' respectively, including “K” for thousands, “M” for millions, and “B” for billions.  
+Having a look at PROPDMGEXP we can see that we have some undefined values like "-", "?", "+". For values like "0", "1", "2", etc. we also were not able to determine their explicit meaning. Furthermore there are 465168 observations with missing values "".
+```{r}
+table(data$PROPDMGEXP, useNA = 'ifany')
+```
+
+Converting lower to uppercases and only looking at observations where PROPDMG greater zero:
+```{r}
+data[, PROPDMGEXP := toupper(PROPDMGEXP)]
+table(data[PROPDMG > 0, PROPDMGEXP], useNA = 'ifany')
+```
+
+Imputing NA's for observations that are not in the set of 'H', 'K', 'M', 'B':
+```{r}
+misc_exponents <- unique(data[ ! PROPDMGEXP %in% c('', 'H', 'K', 'M', 'B'), PROPDMGEXP])
+data[, PROPDMGEXP:=
+         ifelse( PROPDMGEXP %in% misc_exponents,
+                 NA, PROPDMGEXP)]
+```
+
+Furthermore imputing 'NA's to empty PROPDMGEXP variables where there PROPDMG not equals zero:
+```{r}
+data[, PROPDMGEXP:=
+         ifelse( PROPDMGEXP == '' & PROPDMG > 0,
+                NA, PROPDMGEXP)]
+```
+
+Finally converting the variable to a numerical one with propper values set:
+```{r}
+data[, PROPDMGEXP:= ifelse(PROPDMGEXP == '', 0, PROPDMGEXP)]
+data[, PROPDMGEXP:= 
+         ifelse(PROPDMGEXP == 'H',
+                10^2, ifelse(PROPDMGEXP == 'K', 10^3, 
+                             ifelse(PROPDMGEXP == 'M', 10^6,
+                                    ifelse(PROPDMGEXP == 'B', 10^9,
+                                           PROPDMGEXP))))]
+
+data[, PROPDMGEXP:= as.integer(PROPDMGEXP)]
+```
+
+After the conversions we end with following values (actually only 390 NA's):
+```{r}
+table(data$PROPDMGEXP, useNA = 'ifany')
+```
+
+Doing simularly for the variable CROPDMGEXP:
+```{r}
+data[, CROPDMGEXP := toupper(CROPDMGEXP)]
+misc_exponents <- unique(data[ ! CROPDMGEXP %in% c('', 'H', 'K', 'M', 'B'), CROPDMGEXP])
+data[, CROPDMGEXP:=
+         ifelse( CROPDMGEXP %in% misc_exponents,
+                 NA, CROPDMGEXP)]
+data[, CROPDMGEXP:=
+         ifelse( CROPDMGEXP == '' & CROPDMG > 0,
+                 NA, CROPDMGEXP)]
+data[, CROPDMGEXP:= ifelse(CROPDMGEXP == '', 0, CROPDMGEXP)]
+data[, CROPDMGEXP:= 
+         ifelse(CROPDMGEXP == 'K',
+                10^3, ifelse(CROPDMGEXP == 'M', 10^6, 
+                             ifelse(CROPDMGEXP == 'B', 10^9,CROPDMGEXP)))]
+data[, CROPDMGEXP:= as.integer(CROPDMGEXP)]
+table(data$CROPDMGEXP, useNA = 'ifany')
+```
+
+Now we have numerical exponent values to multiply the PROPDMG and CROPDMG variables with:
+```{r}
+data[, PROPDMG:= PROPDMG * PROPDMGEXP]
+data[, CROPDMG:= CROPDMG * CROPDMGEXP]
+```
+
+```{r}
+head(data[PROPDMG > 0, ])
+```
+
+Finally converting the values for PROPDMG and CROPDMG variables to values in millions:
+```{r}
+data[, CROPDMG:= CROPDMG / 1000000]
+data[, PROPDMG:= PROPDMG / 1000000]
+```
+
+### 2.4 Outliers or Doubtful Values  
+
+It seems there are no real outliers for variable FATALITIES. The most fatalities with 583 are reported for the "1995 Chicago Heat wave". The second event in this list is "2011 Joplin Tornado". But actually we are missing "Hurricane Katrina" in this list.
+```{r}
+data[YEAR >= 1993 & FATALITIES > 90, c(3:5,7)][order(-FATALITIES)]
+```
+
+There are also no outliers for variables INJURIES and CROPDMG. More interesting is PROPDMG. The first entry here relates to a flood in 2006 with damages of $115 billion (the next three events are now all belonging to "Hurricane Katrina")
+```{r}
+data[YEAR >= 1993 & PROPDMG > 10000, c(3:5,9)][order(-PROPDMG)]
+```
+
+This FLOOD event with stated wrongly $115 billion damages belongs to a series of events causing heavy **flooding of Napa and Russian River in Northern California (Dec 2005 - Jan 2006)**. According to this document [Storms and Flooding in California](https://pubs.usgs.gov/of/2006/1182/pdf/ofr2006-1182.pdf):  
+
+> "The storms resulted in an estimated $300 million in damages and Federal disaster declarations in 10 counties..."  
+
+Looking at these entries it seems that the amount of $11,500 million is an error due to wrong PROPDMGEXP. Furthermore it seems that we have duplicated entries for the estimated property damages. Both for Napa and Sonoma there are two events for different dates.  
+```{r napa_flood, fig.width=100}
+data[EVTYPE == 'FLOOD' & YEAR %in% c(2005,2006) & STATE == 'CA' &
+         month(BGN_DATE) %in% c(12,1) &
+         COUNTYNAME %in% c('SONOMA', 'NAPA'), c(3:6, 9:12)] %>% head()
+```
+
+We adjust the $115 billion entry to $115 million and remove values for the first of the two double entries:
+```{r fix_napa}
+data[REFNUM == 605943, PROPDMG:=115]
+# And we set the 2005-12-31 events to zero damages to avoid double count:
+data[REFNUM %in% c(567206,567221), PROPDMG:=0]
+data[REFNUM %in% c(567206,567221), CROPDMG:=0]
+```
+
+### 2.5 Event Variable EVTYPE  
+
+We now have data for years 1950 until 2011, but as data collection procedures have changed, the unique event types the data was collected for has also changed over years. More information can be found on .
+
+From 1950 through 1954 only TORNADO events were reported:
+```{r}
+table(data[year(BGN_DATE) <= 1954, EVTYPE])
+```
+
+And from 1955 through 1992 only the following events were reported for ( even if [NOAA Storm Events Database](https://www.ncdc.noaa.gov/stormevents/details.jsp) states the period 1955-1995):
+```{r}
+table(data[year(BGN_DATE) >= 1955 & year(BGN_DATE) <= 1992, EVTYPE])
+```
+
+It will make no sense to compare total values for different events over all years if some of the events are only collected for a shorter period. Therefore we reduce our data set:
+```{r}
+data <- data[year(BGN_DATE) >= 1993]
+```
+
+We now should also be aware that according to the same source [NOAA Storm Events Database](https://www.ncdc.noaa.gov/stormevents/details.jsp) there should be only 48 different event types according to "Directive 10-1605" which we loaded here:
+```{r load_events}
+events <- c("ASTRONOMICAL LOW TIDE",
+            "AVALANCHE",
+            "BLIZZARD",
+            "COASTAL FLOOD",
+            "COLD/WIND CHILL",
+            "DEBRIS FLOW",
+            "DENSE FOG",
+            "DENSE SMOKE",
+            "DROUGHT",
+            "DUST DEVIL",
+            "DUST STORM",
+            "EXCESSIVE HEAT",
+            "EXTREME COLD/WIND CHILL",
+            "FLASH FLOOD",
+            "FLOOD",
+            "FROST/FREEZE",
+            "FUNNEL CLOUD",
+            "FREEZING FOG",
+            "HAIL",
+            "HEAT",
+            "HEAVY RAIN",
+            "HEAVY SNOW",
+            "HIGH SURF",
+            "HIGH WIND",
+            "HURRICANE/TYPHOON",
+            "ICE STORM",
+            "LAKE-EFFECT SNOW",
+            "LAKESHORE FLOOD",
+            "LIGHTNING",
+            "MARINE HAIL",
+            "MARINE HIGH WIND",
+            "MARINE STRONG WIND",
+            "MARINE THUNDERSTORM WIND",
+            "RIP CURRENT",
+            "SEICHE",
+            "SLEET",
+            "STORM SURGE/TIDE",
+            "STRONG WIND",
+            "THUNDERSTORM WIND",
+            "TORNADO",
+            "TROPICAL DEPRESSION",
+            "TROPICAL STORM",
+            "TSUNAMI",
+            "VOLCANIC ASH",
+            "WATERSPOUT",
+            "WILDFIRE",
+            "WINTER STORM",
+            "WINTER WEATHER"
+            )
+```
+
+But in our actual data we see a lot more events (in total there are 985 different ones).
+```{r}
+length(unique(data[, EVTYPE]))
+```
+
+Some example events:
+```{r}
+set.seed(123)
+sample(unique(data[, EVTYPE]), size = 6)
+```
+
+Plotting the number of unique events reported for each year we see a rise of unique events until 1995 and then the attempt to reduce and tidy the reporting system until finally from around 2005 on we ended with 48 single events: 
+```{r unique_events_yr}
+data %>% group_by(YEAR) %>%
+    summarise(unique_events = length(unique(EVTYPE))) %>%
+    ggplot( aes(x = YEAR, y = unique_events)) +
+    geom_bar(stat="identity", fill = 'blue') +
+    labs(x = "Year", y = "Number of Unique Events",
+         title = "Unique Events Recorded in NOAA Database by Year")
+```
+
+Now comes the ugly part, cleaning the event types. First we set all types to uppercase, remove leading whitespaces and remove observations with type "?", "NONE" and those starting with string "SUMMARY" (values are also all zeros). 
+```{r}
+data[, EVTYPE := toupper(EVTYPE)]
+data[, EVTYPE := trimws(EVTYPE)]
+data[EVTYPE == '?' | EVTYPE == 'NONE' , EVTYPE:=NA ]
+data[grepl('^SUMMARY', EVTYPE), EVTYPE:=NA ]
+data <- data[!is.na(EVTYPE)] ; gc()
+length(unique(data[, EVTYPE]))
+```
+
+Next step is substitute misspelled or abreviated strings in the EVTYPE variable by correct one, e.g. replacing "HAIL 1.75)" by just "HAIL".
+```{r}
+sub_list <- list()
+sub_list[[ 'CSTL' ]] <- 'COASTAL'
+sub_list[[ 'FLOODING{0,1}' ]] <- 'FLOOD'
+sub_list[[ 'FLOODS' ]] <- 'FLOOD'
+sub_list[[ 'WINDS{1,2}' ]] <- 'WIND'
+sub_list[[ 'WND' ]] <- 'WIND'
+sub_list[[ 'TSTM' ]] <- 'THUNDERSTORM'
+sub_list[[ 'DRY MICROBURST [0-9]{1,2}' ]] <- 'DRY MICROBURST'
+sub_list[[ 'TH?U[A-Z]*MS{0,1}W?' ]] <- 'THUNDERSTORM'
+sub_list[[ 'FLDG?' ]] <- 'FLOOD'
+sub_list[[ 'THUNDERSTORM WIND[[:blank:]]*\\(?G?[0-9]{1,2}\\)?' ]] <- 'THUNDERSTORM WIND'
+sub_list[[ 'HIGH WIND \\(?G?[0-9]{1,2}\\)?' ]] <- 'HIGH WIND'
+sub_list[[ 'HAIL[[:blank:]]*\\(?G?[0-9]{1,2}\\.?[0-9]*\\)*' ]] <- 'HAIL'
+sub_list[[ '\\/$']] <- ''
+for(pattern in names(sub_list)){
+    data[ , EVTYPE:= gsub(pattern, sub_list[[pattern]], EVTYPE)]
+}
+length(unique(data[, EVTYPE]))
+```
+
+The next step groups events according to regular expressions to our 48 events. A list is generated whose list members are named according the 48 events and its content are just regular expressions. The first regular expression determines  which events should be included, the second one if available determines which will be excluded.  
+For example e_list[["FLASH FLOOD"]] <- c('FLASH', 'STORM|THUNDER') results in assigning events to "FLASH FLOOD" if EVTYPE matches the pattern "FLASH", but not "STORM" or "THUNDER".  
+Note: To simplify this process events of type "FREEZING FOG" are now categorized as "FROST/FREEZE".
+
+The initializing list:
+```{r event_pattern_list}
+e_list <- list()
+e_list[["AVALANCHE"]] <- '^AVALANCH*E'
+e_list[["BLIZZARD"]] <- 'BLIZ|SNOWSTORM'
+e_list[["COASTAL FLOOD"]] <- c('(COAST.*FLOOD|TIDAL|HIGH TIDE)')
+e_list[["EXTREME COLD/WIND CHILL"]] <- 
+    '(EXTRE|RECORD|BITTER|SEVERE|EXCESS|TEMP).*(COLD|CH|RECORD)'
+e_list[["COLD/WIND CHILL_TEMP"]] <- c('(COLD|LOW|UN|WIND|EXTE).*(TEMP|CHIL|COLD)',
+                                      'FOG|EXTRE')
+e_list[["COLD/WIND CHILL"]] <- c('COLD|HYPOTHERMIA', 'EXTREME|FUNNEL|TORNADO|FOG|SNOW|FROST')
+e_list[["DEBRIS FLOW"]] <- 'SLIDE|SLUMP|DEBRIS FLOW'
+e_list[["DENSE FOG"]] <- c('FOG', 'FREEZING|ICE')
+e_list[["FREEZING FOG"]] <- c('FOG', 'DENSE')
+e_list[["DENSE SMOKE"]] <- 'SMOKE'
+e_list[["DROUGHT"]] <- 'DROUGHT'
+e_list[["DUST DEVIL"]] <- 'DUST DEV'
+e_list[["DUST STORM"]] <- c('DUST', 'DEVIL')
+e_list[["EXCESSIVE HEAT"]] <- '(RECORD|EXTREME|EXCESSIVE).*(HEAT|(HIGH|WARM) TEMP)'
+e_list[["HEAT"]] <- c('HEAT', 'EXCESSIVE')
+e_list[["HEAVY SNOW"]] <- c('(HEAV|RECOR|EXCESS).*SNOW', 'LAKE|LIGHT|ICE STORM|FLOOD')
+e_list[["FLASH FLOOD"]] <- c('FLASH', 'STORM|THUNDER')
+e_list[["FLOOD"]] <- c('FLOOD', 'FLASH|LAKE|COASTAL|THUNDER')
+e_list[["LAKESHORE FLOOD"]] <- 'LAKE.*FLOOD'
+e_list[["FROST/FREEZE"]] <- 'FROST|FREEZE|FREEZING|^ICE$|^ICE.*ROAD|GLAZE|ICY ROADS|BLACK ICE'
+e_list[["FUNNEL CLOUD"]] <- 'FUNNEL.*CLOUD|COLD.*FUNNEL'
+e_list[["HAIL"]] <- c('HAIL', 'THUNDER|MAR')
+e_list[["HEAVY RAIN"]] <- c('RAIN|(HEAVY|RECORD|EXCESSIVE).*PRECIP', 'FREEZ|SNOW|LOW|THUNDER')
+e_list[["HIGH SURF"]] <- 'SURF'
+e_list[["HIGH WIND"]] <- c('HIGH.*WIND', 'MARINE|HURR|WINTER|SEAS|TIDE')
+e_list[["HURRICANE/TYPHOON"]] <- 'HURRICANE|TYPHOON'
+e_list[["ICE STORM"]] <- 'ICE.*STORM'
+e_list[["LAKE-EFFECT SNOW"]] <- 'LAKE.*SNOW'
+e_list[["LIGHTNING"]] <- c('LIGHTNING|LIGHTING|LIGNTNING', 'THUNDER|TSTM')
+e_list[["MARINE HIGH WIND"]] <- 'MARINE HIGH WIND|WIND.*SEA|HIGH.*SEA'
+e_list[["RIP CURRENT"]] <- 'RIP.*CURR'
+e_list[["SLEET"]] <- 'SLEET'
+e_list[["STORM SURGE/TIDE"]] <- 'SURGE'
+e_list[["STRONG WIND"]] <- c('STRONG.*WIND', 'MARINE')
+e_list[["THUNDERSTORM WIND"]] <- c('THUNDER|BURST|GUST|WHIRL', 'TORNADO|NON|MARINE')
+e_list[["TORNADO"]] <- c('TORN') # waterspouts included here
+e_list[["TROPICAL STORM"]] <- c('TROPICAL STORM')
+e_list[["VOLCANIC ASH"]] <- 'VOLCANIC'
+e_list[["WATERSPOUT"]] <- 'WATER.*SP'
+e_list[["WILDFIRE"]] <- 'FIRE'
+e_list[["WINTER STORM"]] <- 'WINTER.*STORM'
+e_list[["WINTER WEATHER_TEMP"]] <- c('SNOW','LAKE|STORM|HEAVY|LACK|WIND')
+e_list[["WINTER WEATHER"]] <- 'WINTER.*WEATHER|WINTE?RY? MIX'
+```
+
+The script with detailed output which events are assigned to which final events:
+```{r}
+for(category in names(e_list)){
+    cat('\n',category,':\n')
+    
+    if(length(e_list[[category]]) == 1){
+        print(unique(data[grepl(e_list[[category]], EVTYPE), EVTYPE]))
+        data[grepl(e_list[[category]], EVTYPE), EVTYPE:=category]
+    }
+    if(length(e_list[[category]]) == 2){
+        print(unique(data[grepl(e_list[[category]][1], EVTYPE) &
+                              ! grepl(e_list[[category]][2], EVTYPE),EVTYPE]))
+        data[grepl(e_list[[category]][1], EVTYPE) & 
+                 ! grepl(e_list[[category]][2], EVTYPE),EVTYPE:=category]
+    }
+}
+length(unique(data[, EVTYPE]))
+```
+
+It should be mentioned that the cleaning process followed the [Storm Data Documentation](https://d396qusza40orc.cloudfront.net/repdata%2Fpeer2_doc%2Fpd01016005curr.pdf) and also sometimes needed to investigate the REMARKS variable. But due to missing accuracy of orignial data and sometimes unclear rules some of the events may not always classified to their correct groups.  
+Finally we are now left with only 176 unique events, but more important is that the still not proper classified events only account for a very small amout of damages or fatalities/injuries:
+```{r}
+data[! EVTYPE %in% events & 
+         (INJURIES > 0 | FATALITIES > 0 | PROPDMG > 0 | CROPDMG > 0), ][, 
+                            .(SUM_FATALITIES = sum(FATALITIES), 
+                              SUM_INJURIES = sum(INJURIES), 
+                              SUM_PROPDMG = sum(PROPDMG, na.rm = T),
+                              SUM_CROPDMG = sum(CROPDMG, na.rm = T))]
+```
+
+Finally we adjust the monetary values of PROPDMG and CROPDMG to year 2017:
+```{r}
+data[, PROPDMG:= PROPDMG / adj_factor]
+data[, CROPDMG:= CROPDMG / adj_factor]
+```
+
+## 3. Results  
+
+For analyzing the data we first aggregate our data by event types and calculate totals for each of the four variables we are interested in, namely: FATALITIES, INJURIES, PROPDMG and CROPDMG:
+```{r aggregate_data}
+event_impacts <-
+    data %>%
+    group_by(EVTYPE) %>%
+    summarise(Count = n(), 
+              Fatalities = sum(FATALITIES, na.rm = TRUE), 
+              Injuries = sum(INJURIES, na.rm = TRUE), 
+              PropertyDamages = sum(PROPDMG, na.rm = TRUE),
+              CropDamages = sum(CROPDMG, na.rm = TRUE),
+              SumDamages = sum(CROPDMG + PROPDMG, na.rm = TRUE)
+    ) %>% as.data.frame()
+```
+
+### 3.1 Harmfulness of Events to Population Health  
+
+Question: Across the United States, which types of events (as indicated in the EVTYPE variable) are most harmful with respect to population health?
+We are clearly interested in fatalities and injuries caused by different events. As we cannot simply add these two variables (how many injuries are worth one dead) we first look at them seperately.
+
+First list the top 10 events which account for most fatalities:
+```{r}
+top10_fatalities <-
+    event_impacts %>% arrange(desc(Fatalities)) %>%
+    select(EVTYPE, Count, Fatalities, Injuries) %>% head(n = 10)
+kable(top10_fatalities)
+```
+
+Second the top 10 events regarding injuries:
+```{r}
+top10_injuries <-
+    event_impacts %>% arrange(desc(Injuries)) %>%
+    select(EVTYPE, Count, Fatalities, Injuries) %>% head(n = 10)
+kable(top10_injuries)
+```
+
+Plotting a Bubble Plot for total Injuries over Fatalities by Events we again see that events "EXCESSIVE HEAT" and "TORNADO" account for the most fatalities, followed by events "HEAT" and "FLASH FLOOD". Interestingly event "TORNADO" is also responsible for an unusual high number of injuries. Again it needs to be mentioned that we somehow are missing the event type "HURRICANE/TYPHOON". Let alone [Hurricane Katrina - Wikipedia](https://en.wikipedia.org/wiki/Hurricane_Katrina) is reported for more than one thousand fatalities.
+```{r bubble_plot}
+ggplot(data = top10_fatalities,
+       aes(x = Fatalities, y = Injuries, col = EVTYPE, size = Count)) +
+    geom_point(alpha = 0.7) +
+    scale_size_continuous(range = c(2, 10)) +
+    scale_colour_discrete(guide = FALSE) +
+    geom_text_repel( data = top10_fatalities[1:10,], aes(label = EVTYPE), size = 2.5) +
+    labs(x = "Fatalities (Total per Event)", y = "Injuries (Total per Event)",
+         title = "Top 10 Most Harmful Events (1993 - 2011)")
+```
+
+
+### 3.1 Monetary Consequences of Events on Economy  
+
+Question: Across the United States, which types of events have the greatest economic consequences?
+
+Answering this question we just list the top 10 events regarding the total sum of property and crop damages:
+```{r}
+top10_economics <-
+    event_impacts %>% arrange(desc(SumDamages)) %>%
+    select(EVTYPE, Count,SumDamages, PropertyDamages, CropDamages) %>% head(n = 10)
+kable(top10_economics, digits = 0,
+      col.names = c('Event Type','Count', 'Total Damages', 'Total Property', 'Total Crop'),
+      caption = 'Top 10 Events with Impact to Economics')
+```
+
+The following barplot illustrates that the most harmful events with respect to economy is clearly "HURRICANE/TYPHOON", with nearly twice the damages than "FLOOD" and "STORM SURGE/TIDE" events. Property damages mostly outstand crop damages except for "DROUGHT":
+
+```{r  barplot_damages, warning=FALSE}
+top10_economics <- melt(select(top10_economics, EVTYPE, PropertyDamages, CropDamages))
+top10_economics$EVTYPE <-    reorder(top10_economics$EVTYPE, rowSums(top10_economics[3]))
+top10_economics %>%
+    ggplot(aes(x = EVTYPE, y = value, fill = variable, order = variable)) +
+    geom_bar(stat="identity") +
+    coord_flip() +
+    labs(x = 'Event Type', y = 'Total Damages in Million USD', 
+         title = 'Top 10 Events with Impact to Economy(Propery and Crop) (1993-2011)')
+```
+
